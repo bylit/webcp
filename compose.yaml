@@ -1,0 +1,23 @@
+services:
+  webcp:
+    build: .
+    container_name: webcp
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      MAX_CONCURRENT_DOWNLOADS: "4"
+      # The folder picker opens here initially. Any absolute container path works.
+      DOWNLOAD_DIR: /data/downloads
+      # Authentication can use AUTH_USER/AUTH_PASSWORD or a mounted file.
+      # AUTH_ENABLED: "true"
+      # AUTH_CREDENTIALS_FILE: /run/secrets/webcp-credentials
+    volumes:
+      - webcp-data:/data
+      # Additional mounts appear automatically in the container filesystem picker:
+      # - /srv/media:/storage/media
+      # - /srv/backups:/storage/backups
+      # - ./webcp.credentials:/run/secrets/webcp-credentials:ro
+
+volumes:
+  webcp-data:
