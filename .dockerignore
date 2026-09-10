@@ -1,0 +1,7 @@
+.git
+.github
+.gitignore
+data
+docs
+*.md
+compose.yaml
