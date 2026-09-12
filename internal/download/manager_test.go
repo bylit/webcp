@@ -26,6 +26,7 @@ type controlledBody struct {
 	mu      sync.Mutex
 	reads   int
 	release <-chan struct{}
+	blocked chan struct{}
 }
 
 func (body *controlledBody) Read(buffer []byte) (int, error) {
@@ -37,6 +38,9 @@ func (body *controlledBody) Read(buffer []byte) (int, error) {
 		return copy(buffer, bytes.Repeat([]byte("a"), 32*1024)), nil
 	}
 	if read == 2 {
+		if body.blocked != nil {
+			close(body.blocked)
+		}
 		<-body.release
 		return copy(buffer, bytes.Repeat([]byte("b"), 32*1024)), nil
 	}
@@ -230,7 +234,8 @@ func TestDeleteWaitsForTransferBeforeRemovingFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	release := make(chan struct{})
-	body := &controlledBody{release: release}
+	blocked := make(chan struct{})
+	body := &controlledBody{release: release, blocked: blocked}
 	manager.client = &http.Client{Transport: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode:    http.StatusOK,
@@ -246,17 +251,18 @@ func TestDeleteWaitsForTransferBeforeRemovingFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, time.Second, func() bool {
-		current, getErr := manager.Get(job.ID)
-		return getErr == nil && current.DownloadedBytes >= 32*1024
-	})
+	select {
+	case <-blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("transfer never reached the blocking read")
+	}
 
 	deleted := make(chan error, 1)
 	go func() { deleted <- manager.Delete(job.ID) }()
 	select {
 	case err := <-deleted:
 		t.Fatalf("Delete returned before the transfer stopped: %v", err)
-	case <-time.After(75 * time.Millisecond):
+	case <-time.After(250 * time.Millisecond):
 	}
 
 	close(release)
@@ -265,7 +271,7 @@ func TestDeleteWaitsForTransferBeforeRemovingFile(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("Delete did not return after the transfer stopped")
 	}
 	if _, err := os.Stat(filepath.Join(directory, job.Filename)); !os.IsNotExist(err) {

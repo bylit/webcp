@@ -29,6 +29,7 @@ func main() {
 		logger.Error("could not initialize download manager", "error", err)
 		os.Exit(1)
 	}
+	defer manager.Close()
 	manager.Recover()
 
 	address := env("LISTEN_ADDR", ":8080")

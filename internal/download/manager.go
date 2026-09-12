@@ -74,6 +74,8 @@ type Manager struct {
 	semaphore     chan struct{}
 	logger        *slog.Logger
 	persistSignal chan struct{}
+	stop          chan struct{}
+	stopOnce      sync.Once
 }
 
 var (
@@ -105,6 +107,7 @@ func NewManager(defaultPath, stateFile string, maxConcurrent int, logger *slog.L
 		semaphore:     make(chan struct{}, maxConcurrent),
 		logger:        logger,
 		persistSignal: make(chan struct{}, 1),
+		stop:          make(chan struct{}),
 	}
 	if err := os.MkdirAll(defaultPath, 0o755); err != nil {
 		return nil, fmt.Errorf("create default download directory: %w", err)
@@ -244,9 +247,9 @@ func (m *Manager) Create(rawURL, destination string) (Job, error) {
 	m.jobs[job.ID] = job
 	m.persistLocked()
 	m.startLocked(job)
-	copy := *job
+	snapshot := *job
 	m.mu.Unlock()
-	return copy, nil
+	return snapshot, nil
 }
 
 func (m *Manager) List() []Job {
@@ -472,6 +475,11 @@ func (m *Manager) transfer(ctx context.Context, job *Job) error {
 	if offset > 0 && resp.StatusCode != http.StatusPartialContent {
 		offset = 0 // Server ignored Range, so safely restart instead of appending duplicates.
 	}
+	if offset > 0 && resp.StatusCode == http.StatusPartialContent {
+		if start := startFromContentRange(resp.Header.Get("Content-Range")); start >= 0 && start != offset {
+			offset = 0 // Server resumed from the wrong offset, so restart instead of corrupting the file.
+		}
+	}
 
 	if offset == 0 {
 		if remoteName := filenameFromResponse(resp); remoteName != "" && remoteName != filename {
@@ -502,7 +510,6 @@ func (m *Manager) transfer(ctx context.Context, job *Job) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
 
 	total := resp.ContentLength
 	if resp.StatusCode == http.StatusPartialContent {
@@ -548,12 +555,21 @@ func (m *Manager) transfer(ctx context.Context, job *Job) error {
 			m.mu.Unlock()
 		}
 		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
-				return nil
+			if !errors.Is(readErr, io.EOF) {
+				_ = file.Close()
+				return readErr
 			}
-			return readErr
+			break
 		}
 	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("sync downloaded file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close downloaded file: %w", err)
+	}
+	return nil
 }
 
 func (m *Manager) availableFilenameLocked(destination, requested, exceptID string) string {
@@ -641,11 +657,26 @@ func (m *Manager) load() error {
 }
 
 func (m *Manager) persistenceLoop() {
-	for range m.persistSignal {
-		m.mu.Lock()
-		m.persistLocked()
-		m.mu.Unlock()
+	for {
+		select {
+		case <-m.persistSignal:
+			m.mu.Lock()
+			m.persistLocked()
+			m.mu.Unlock()
+		case <-m.stop:
+			return
+		}
 	}
+}
+
+func (m *Manager) Close() error {
+	m.stopOnce.Do(func() {
+		close(m.stop)
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		m.persistLocked()
+	})
+	return nil
 }
 
 func (m *Manager) signalPersist() {
@@ -680,11 +711,11 @@ func (m *Manager) persistLocked() {
 }
 
 func cloneJob(job *Job) Job {
-	copy := *job
-	copy.cancel = nil
-	copy.deleted = false
-	copy.runtime = nil
-	return copy
+	clone := *job
+	clone.cancel = nil
+	clone.deleted = false
+	clone.runtime = nil
+	return clone
 }
 
 func filenameFromURL(parsed *url.URL) string {
@@ -720,6 +751,22 @@ func sanitizeFilename(name string) string {
 		name = string(runes[:180])
 	}
 	return name
+}
+
+func startFromContentRange(value string) int64 {
+	fields := strings.SplitN(strings.TrimSpace(value), " ", 2)
+	if len(fields) != 2 {
+		return -1
+	}
+	start, _, found := strings.Cut(fields[1], "-")
+	if !found {
+		return -1
+	}
+	parsed, err := strconv.ParseInt(start, 10, 64)
+	if err != nil {
+		return -1
+	}
+	return parsed
 }
 
 func totalFromContentRange(value string) int64 {
